@@ -17,3 +17,11 @@ This more detailed diagram shows how the model's addition algorithm is "coded" i
 ![StaircaseA3_Detailed](./StaircaseA3_Detailed.svg?raw=true "StaircaseA3_Detailed")
 
 Detailed diagram legend: **A:** For A3, the addition algorithm combines information from digits 3, 2 and 1. **B:** 1st Head calculates MC1 on digit 1. **C:** 2nd Head calculates MC1 and MS9 (which are independent of each other and so at most one is true) on digit 2. **D:** 3rd Head does Base Add on digit 3. **E:** The MLP layer uses trigrams to combine the information from the 3 heads to give the final answer A3. 
+
+## Tips for using the Colab
+ * You can run all the code in the CoLab notebook yourself in Google CoLab ( https://colab.research.google.com/ ). You can change the code and experiment.
+ * To use the notebook, in Google CoLab, **you will need to** go to Runtime > Change Runtime Type and select GPU as the hardware accelerator.
+ * The graphs are interactive!
+ * Use the table of contents pane in the sidebar to navigate
+ * Collapse irrelevant sections with the dropdown arrows
+ * Search the page using the search in the sidebar, not CTRL+F
