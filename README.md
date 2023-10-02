@@ -6,4 +6,8 @@ The CoLab defines, trains and analyses a 1 layer Transformer model that performs
 
 ![QuestionAnswer](./QuestionAnswer.svg?raw=true "Question Answer Shape")
 
+This CoLab allowed the authors to understand the model's addition algorithm, summarised in this diagram: 
 
+![StaircaseA3_Summary](./StaircaseA3_Summary.svg?raw=true "StaircaseA3_Summary")
+
+**A:** The 5 digit question is revealed token by token. The highest-value digit is revealed first. **B:** From the "=" token, the model attentions heads focus on successive pairs of digits, giving a 'staircase' attention pattern visible in 15 digit, 5 digit, etc addition. **C:** The 3 heads are time-offset from each other by 1 token so in each epoch data from 3 tokens is available. **D:** To calculate A3, the 3 heads do independent simple mathematical calculations on D3, D2 & D1. The results are combined by the MLP layer using 60 trigrams. A3 is calculated one token before it is needed. This approach is repeated for all answer digits.
