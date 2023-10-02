@@ -1,6 +1,9 @@
-# conceptual-interp
-✱ Understanding the underlying learning dynamics of simple tasks in Transformer networks
+# Understanding Integer Addition in Transformers
 
-Understanding how a neural network does what it does would greatly improve human ability to evaluate the safety of that model. This project seeks to explain the 5 digit addition (toy) model completely, and document a generalized method for investigating a class of similar models. The project aims to add to the existing library of explained neural network circuits and help speed discovery of more circuits
+Understanding the inner workings of machine learning models like Transformers is vital for their safe and ethical use. This repository contains a CoLab that presents an in-depth analysis of a one-layer Transformer model trained for integer addition.
 
-This project follows on from [towards-interpretability-of-5-digit-addition](https://alignmentjam.com/project/towards-interpretability-of-5-digit-addition) draft paper.
+The CoLab defines, trains and analyses a 1 layer Transformer model that performs integer addition e.g. 33357+82243=115600. Each digit is a separate token. For 5 digit addition, the model is given 12 "question" (input) tokens, and must then predict the corresponding 6 "answer" (output) tokens:   
+
+![QuestionAnswer](./QuestionAnswer.svg?raw=true "Question Answer Shape")
+
+
