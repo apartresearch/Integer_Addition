@@ -1,4 +1,6 @@
-# Understanding Integer Addition in Transformers
+# offical Understanding Integer Addition in Transformers
+### by Philip Quirke Fazl Barez
+
 
 Understanding the inner workings of machine learning models like Transformers is vital for their safe and ethical use. 
 This repository contains a CoLab ( [./Understanding_Addition_in_Transformers.ipynb](https://github.com/apartresearch/conceptual-interp/blob/main/Understanding_Addition_in_Transformers.ipynb) ) that presents an in-depth analysis of a one-layer Transformer model trained for integer addition.
@@ -25,3 +27,15 @@ Detailed diagram legend: **A:** For A3, the addition algorithm combines informat
  * Use the table of contents pane in the sidebar to navigate
  * Collapse irrelevant sections with the dropdown arrows
  * Search the page using the search in the sidebar, not CTRL+F
+
+```bibtex
+@inproceedings{quirke2024understanding,
+      title={Understanding Addition in Transformers},
+      author={Philip Quirke and Fazl Barez},
+      booktitle={International Conference on Learning Representations (ICLR)},
+      year={2024},
+      address={Vienna, Austria},
+      eprint={2310.13121},
+      archivePrefix={arXiv},
+      primaryClass={cs.LG}
+}
