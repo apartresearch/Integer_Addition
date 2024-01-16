@@ -1,5 +1,5 @@
-# offical Understanding Integer Addition in Transformers
-### by Philip Quirke Fazl Barez
+# Offical Understanding Integer Addition in Transformers
+### by Philip Quirke and Fazl Barez
 
 
 Understanding the inner workings of machine learning models like Transformers is vital for their safe and ethical use. 
