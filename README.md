@@ -28,6 +28,9 @@ Detailed diagram legend: **A:** For A3, the addition algorithm combines informat
  * Collapse irrelevant sections with the dropdown arrows
  * Search the page using the search in the sidebar, not CTRL+F
 
+#### Reference 
+If you use or find this work helpful, please consider citing our work:
+
 ```bibtex
 @inproceedings{quirke2024understanding,
       title={Understanding Addition in Transformers},
