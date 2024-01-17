@@ -1,5 +1,5 @@
-# Offical Understanding Integer Addition in Transformers
-### by Philip Quirke and Fazl Barez
+## Official Repository for Understanding Integer Addition in Transformers, ICLR 2024 | Authors Philip Quirke and Fazl Barez
+
 
 
 Understanding the inner workings of machine learning models like Transformers is vital for their safe and ethical use. 
