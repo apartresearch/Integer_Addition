@@ -1,0 +1,1480 @@
+# Janky code to do different setup when run in a Colab notebook vs VSCode
+DEVELOPMENT_MODE = True
+try:
+    import google.colab
+    IN_COLAB = True
+    print("Running as a Colab notebook")
+    %pip install kaleido
+    #%pip install git+https://github.com/neelnanda-io/TransformerLens.git@new-demo
+    %pip install transformer_lens
+    %pip install git+https://github.com/callummcdougall/CircuitsVis.git#subdirectory=python
+    #%pip install circuitsvis
+    %pip install jaxtyping
+    %pip install einops
+    %pip install fancy_einsum
+    %pip install torchtyping
+    %pip install transformers
+    %pip install datasets
+except:
+    IN_COLAB = False
+    print("Running as a Jupyter notebook - intended for development only!")
+    from IPython import get_ipython
+
+    ipython = get_ipython()
+    # Code to automatically update the HookedTransformer code as its edited without restarting the kernel
+    ipython.magic("load_ext autoreload")
+    ipython.magic("autoreload 2")
+
+# Plotly needs a different renderer for VSCode/Notebooks vs Colab argh
+import kaleido
+import plotly.io as pio
+
+if IN_COLAB or not DEVELOPMENT_MODE:
+    pio.renderers.default = "colab"
+else:
+    pio.renderers.default = "notebook_connected"
+print(f"Using renderer: {pio.renderers.default}")
+
+import plotly.express as px
+import plotly.graph_objects as go
+
+pio.templates['plotly'].layout.xaxis.title.font.size = 20
+pio.templates['plotly'].layout.yaxis.title.font.size = 20
+pio.templates['plotly'].layout.title.font.size = 30
+
+# Import stuff
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+import numpy as np
+import einops
+from fancy_einsum import einsum
+import tqdm.auto as tqdm
+import random
+from pathlib import Path
+from torch.utils.data import DataLoader
+
+from jaxtyping import Float, Int
+from torchtyping import TensorType as TT
+from typing import List, Union, Optional
+from functools import partial
+import copy
+
+import itertools
+from transformers import AutoModelForCausalLM, AutoConfig, AutoTokenizer
+import dataclasses
+import datasets
+from IPython.display import HTML
+from IPython.display import display
+
+import circuitsvis as cv
+
+
+import transformer_lens
+import transformer_lens.utils as utils
+from transformer_lens.hook_points import (
+    HookedRootModule,
+    HookPoint,
+)  # Hooking utilities
+from transformer_lens import HookedTransformer, HookedTransformerConfig, FactoredMatrix, ActivationCache
+
+def imshow(tensor, renderer=None, xaxis="", yaxis="", **kwargs):
+    px.imshow(utils.to_numpy(tensor), color_continuous_midpoint=0.0, color_continuous_scale="RdBu", labels={"x":xaxis, "y":yaxis}, **kwargs).show(renderer)
+
+def line(tensor, renderer=None, xaxis="", yaxis="", **kwargs):
+    px.line(utils.to_numpy(tensor), labels={"x":xaxis, "y":yaxis}, **kwargs).show(renderer)
+
+def scatter(x, y, xaxis="", yaxis="", caxis="", renderer=None, **kwargs):
+    x = utils.to_numpy(x)
+    y = utils.to_numpy(y)
+    px.scatter(y=y, x=x, labels={"x":xaxis, "y":yaxis, "color":caxis}, **kwargs).show(renderer)
+
+#@markdown Model
+n_layers = 1
+d_vocab = 12
+n_heads = 3 #@param
+d_model = ( 512 // n_heads ) * n_heads    # About 512, and divisible by n_heads
+d_head = d_model // n_heads
+d_mlp = 4 * d_model
+seed = 129000 #@param
+
+#@markdown Data
+n_digits = 5 #@param
+n_ctx = 3 * n_digits + 3
+act_fn = 'relu'
+batch_size = 64 #@param
+
+#@markdown Optimizer
+lr = 0.00008 #@param
+weight_decay = 0.1 #@param
+n_epochs = 5000
+
+# Special tokens
+PLUS_INDEX = 10
+EQUALS_INDEX = 11
+
+# Train or load model? Training saves the model weights in a temporary CoLab file
+train_model = True #@param
+# The name of the temporary CoLab file
+PthLocation = "model.pth"
+
+# Optional. Save graphs to files as PDF and HTML
+save_graph_to_file = True
+# Optional. Performs data-generator sanity checks on 1% of training data
+unit_tests = False
+
+# Embedding / Unembedding
+
+def tokens_to_string(tokens):
+    tokens = utils.to_numpy(tokens)
+    x = "".join([str(i) for i in tokens[:n_digits]])
+    y = "".join([str(i) for i in tokens[n_digits+1:n_digits*2+1]])
+    z = "".join([str(i) for i in tokens[n_digits*2+2:]])
+    return f"{x}+{y}={z}"
+
+def string_to_tokens(string, batch=False):
+    lookup = {str(i):i for i in range(10)}
+    lookup['+']=PLUS_INDEX
+    lookup['=']=EQUALS_INDEX
+    tokens = [lookup[i] for i in string if i not in '\n ']
+    if batch:
+        return torch.tensor(tokens)[None, :]
+    else:
+        return torch.tensor(tokens)
+
+# Transformer creation
+
+# Structure is documented at https://neelnanda-io.github.io/TransformerLens/transformer_lens.html#transformer_lens.HookedTransformerConfig.HookedTransformerConfig
+cfg = HookedTransformerConfig(
+    n_layers = n_layers,
+    n_heads = n_heads,
+    d_model = d_model,
+    d_head = d_head,
+    d_mlp = d_mlp,
+    act_fn = act_fn,
+    normalization_type = 'LN',
+    d_vocab=d_vocab,
+    d_vocab_out=d_vocab,
+    n_ctx=n_ctx,
+    init_weights = True,
+    device="cuda",
+    seed = seed,
+)
+
+model = HookedTransformer(cfg)
+
+optimizer = optim.AdamW(model.parameters(),
+                        lr=lr,
+                        weight_decay=weight_decay,
+                        betas=(0.9, 0.98))
+
+scheduler = optim.lr_scheduler.LambdaLR(optimizer, lambda step: min(step/10, 1))
+
+# Loss functions
+
+# Calculate the per-token probability by comparing a batch of prediction "logits" to answer "tokens"
+def logits_to_tokens_loss(logits, tokens):
+
+  # The last "n_digit+1" tokens are the addition answer probabilities
+  ans_logits = logits[:, -(n_digits+2):-1]
+
+  # Convert raw score (logits) vector into a probability distribution.
+  # Emphasize the largest scores and suppress the smaller ones, to make them more distinguishable.
+  ans_probs = F.log_softmax(ans_logits.to(torch.float64), dim=-1)
+
+  max_indices = torch.argmax(ans_probs, dim=-1)
+
+  # The last "n_digit+1" tokens are the model’s answer.
+  ans_tokens = tokens[:, -(n_digits+1):]
+
+  # Extract values from the ans_probs tensor, based on indices from the ans_tokens tensor
+  ans_loss = torch.gather(ans_probs, -1, ans_tokens[:, :, None])[..., 0]
+
+  return ans_loss, max_indices
+
+# Calculate loss as negative of average per-token mean probability
+def loss_fn(ans_loss):
+  return -ans_loss.mean(0)
+
+# Define "iterator" data generator function. Invoked using next().
+# Batch entries are in format XXXXX+YYYYY=ZZZZZZ e.g. 55003+80002=135005
+# Note that answer has one more digit than the question
+# Returns characteristics of each batch entry to aid later graphing
+def data_generator(batch_size, n_digits, seed):
+    torch.manual_seed(seed)
+    while True:
+        #generate a batch of addition questions (answers calculated below)
+        batch = torch.zeros((batch_size, 3*n_digits+3)).to(torch.int64)
+        x = torch.randint(0, 10, (batch_size, n_digits))
+        y = torch.randint(0, 10, (batch_size, n_digits))
+
+
+        # The UseSum9 task is compound and rare (6%) and so the hardest to learn.
+        # For 20% of batches, we increase the MakeSum9 cases by 20%
+        # UseSum9 also relies on MakeCarry1 (50%) from previous column.
+        # So UseSum9 frequency is increased by 20% * 20% * 50% = 2%
+        if random.randint(1, 5) == 1:
+          # Flatten x and y to 1D tensors
+          x_flat = x.view(-1)
+          y_flat = y.view(-1)
+
+          num_elements_to_modify = int(0.20 * x.numel())
+          indices_to_modify = torch.randperm(x_flat.numel())[:num_elements_to_modify]
+          if random.randint(1, 2) == 1:
+            x_flat[indices_to_modify] = 9 - y_flat[indices_to_modify]
+          else:
+            y_flat[indices_to_modify] = 9 - x_flat[indices_to_modify]
+
+          # Reshape x and y back to its original shape
+          x = x_flat.view(x.shape)
+          y = y_flat.view(x.shape)
+
+
+        batch[:, :n_digits] = x
+        batch[:, n_digits] = PLUS_INDEX
+        batch[:, 1+n_digits:1+n_digits*2] = y
+        batch[:, 1+n_digits*2] = EQUALS_INDEX
+
+        # These attributes are used for testing the model training progress
+        base_adds = torch.zeros((batch_size,n_digits)).to(torch.int64)
+        make_carry1s = torch.zeros((batch_size,n_digits)).to(torch.int64)
+        sum9s = torch.zeros((batch_size,n_digits)).to(torch.int64)
+        use_carry1s = torch.zeros((batch_size,n_digits)).to(torch.int64)
+        use_sum9s = torch.zeros((batch_size,n_digits)).to(torch.int64)
+
+        # generate the addition question answers & other info for testing
+        for i in range(n_digits):
+            # the column in the test attributes being updated
+            test_col = n_digits-1-i
+
+            base_add = batch[:, n_digits-1-i]+batch[:, 2*n_digits-i]
+            base_adds[:, test_col] = base_add
+
+            sum9 = (base_add == 9)
+            sum9s[:, test_col] = sum9
+
+            if i>0:
+              use_carry1s[:, test_col] = make_carry1s[:, test_col+1]
+            use_carry = use_carry1s[:, test_col]
+
+            use_sum9s[:, test_col] = sum9 & use_carry;
+
+            digit_sum = base_add + use_carry1s[:, test_col]
+
+            make_carry = (digit_sum >= 10)
+            make_carry1s[:, test_col] = make_carry
+
+            batch[:, -1-i] = (digit_sum % 10)
+
+        # Final (possible) carry to highest digit of the sum
+        batch[:, -1-n_digits] = make_carry1s[:, 0]
+
+        yield batch.cuda(), base_adds.cuda(), make_carry1s.cuda(), sum9s.cuda(), use_carry1s.cuda(), use_sum9s.cuda()
+
+# Data generator unit test (optional)
+# This unit test checks that the above data_generator function is sensible
+def unit_test_data_generator(train_tokens, train_use_carry1s, train_make_carry1s):
+  test_token = train_tokens[0]
+  test_use_carry = train_use_carry1s[0]
+  test_make_carry = train_make_carry1s[0]
+
+  if n_digits == 5:
+    digits = test_token.cpu().numpy()
+    use = test_use_carry.cpu().numpy()
+    force = test_make_carry.cpu().numpy()
+    num1 = digits[0]*10000 + digits[1]*1000 + digits[2]*100 + digits[3]*10 + digits[4];
+    num2 = digits[6]*10000 + digits[7]*1000 + digits[8]*100 + digits[9]*10 + digits[10];
+    sum = digits[12]*100000 + digits[13]*10000 + digits[14]*1000 + digits[15]*100 + digits[16]*10 + digits[17];
+    assert num1 + num2 == sum, "Unit test failed: Data generator: Bad sum"
+    assert (digits[4]+digits[10]+use[4]>=10) == force[4], "Unit test failed: Data generator: Bad carry 0"
+    assert (digits[3]+digits[9]+use[3]>=10) == force[3], "Unit test failed: Data generator: Bad carry 1"
+    assert (digits[2]+digits[8]+use[2]>=10) == force[2], "Unit test failed: Data generator: Bad carry 2"
+    assert (digits[1]+digits[7]+use[1]>=10) == force[1], "Unit test failed: Data generator: Bad carry 3"
+    assert (digits[0]+digits[6]+use[0]>=10) == force[0], "Unit test failed: Data generator: Bad carry 4"
+
+# Base-Add-only loss
+# Identify the subset of (simple) tokens that only require BA (not UC1 or US9) to get the correct answer
+# Array index 0 is the 'Units' digit. Array index 3 is the 'Thousands' digit.
+ba_alldigits_loss = []
+ba_alldigits_oneloss = 0
+
+ba_perdigit_loss = []
+ba_perdigit_cases = 0
+ba_total_cases = 0
+
+
+# Base Add AllDigits
+# Identity the tokens in the batch where UC1 is false for all columns simultaneously, so only BA is required on all digits
+def calculate_ba_oneloss(tokens, per_token_losses, base_adds, use_carry1s):
+  global ba_alldigits_oneloss
+
+  answer = 0
+  any_use_carry1s = torch.any(use_carry1s.bool(), dim=1)
+  no_use_carry1s = ~ any_use_carry1s
+  num_cases = utils.to_numpy(torch.sum(no_use_carry1s))
+  if num_cases > 0 :
+    filtered_loss = per_token_losses[:, -n_digits:] * no_use_carry1s[:, None]
+    sum_loss = torch.sum(filtered_loss)
+    answer = - utils.to_numpy(sum_loss) / num_cases
+    answer = answer / n_digits  # Approximately align the scale of ba_alldigits_loss to ba_perdigit_loss
+  ba_alldigits_oneloss = answer
+
+
+def calculate_ba_loss(tokens, per_token_losses, base_adds, use_carry1s):
+  global ba_perdigit_cases
+  global ba_total_cases
+
+  # Base Add All Digits
+  # Identity the tokens in the batch where UC1 is false for all columns simultaneously, so only BA is required on all digits
+  calculate_ba_oneloss(tokens, per_token_losses, base_adds, use_carry1s)
+  ba_alldigits_loss.append(ba_alldigits_oneloss)
+
+
+  # Base Add Per Digit
+  # For each token in the batch, identity the digit columns (e.g. 3) where use_carry is false, so only BA is required on that digit
+  ba_perdigit_cases = 0;
+  for digit_num in range(n_digits):
+    answer = 0
+    no_use_carry = 1 - use_carry1s[:, -1-digit_num]
+    num_cases = utils.to_numpy(torch.sum(no_use_carry))
+    ba_perdigit_cases += num_cases
+    ba_total_cases += num_cases
+    if num_cases > 0 :
+      filtered_loss = per_token_losses[:, -1-digit_num] * no_use_carry
+      sum_loss = torch.sum(filtered_loss)
+      answer = - utils.to_numpy(sum_loss) / num_cases
+    if len(ba_perdigit_loss)<=digit_num:
+      ba_perdigit_loss.append([])
+    if (num_cases == 0) & (len(ba_perdigit_loss[digit_num]) > 0) :
+      answer = ba_perdigit_loss[digit_num][-1] # Use the previous step's loss. Improves graph
+    ba_perdigit_loss[digit_num].append(answer)
+
+# Use Carry 1 loss
+# Identify the subset of tokens that require UC1 (but not US9) to get the correct answer
+# Array index 0 is the 'Units' digit. Array index 3 is the 'Thousands' digit.
+uc1_anydigits_loss = []
+uc1_anydigits_oneloss = 0
+
+uc1_perdigit_loss = []
+uc1_perdigit_cases = 0
+uc1_total_cases = 0
+
+
+# UC1 AnyDigits (exclude Sum9)
+# Identity the tokens in the batch where UC1 is used at least once over the columns & Sum9 is never used
+def calculate_uc1_loss_any(tokens, per_token_losses, use_carry1s, sum9s):
+  global uc1_anydigits_oneloss
+
+  num_use_carry1s = torch.sum(use_carry1s, dim=1)
+  any_use_carry1s = torch.where( num_use_carry1s != 0, 1, 0 ) # At least one digit uses UC1
+  num_sum9s = torch.sum(use_sum9s, dim=1)
+  no_sum9s = torch.where( num_sum9s == 0, 1, 0 ) # No digits have Sum9 true
+  filtered_cases = any_use_carry1s & no_sum9s
+  num_cases = utils.to_numpy(torch.sum(filtered_cases))
+  filtered_indices = torch.nonzero(filtered_cases).squeeze()
+  filtered_token_losses = per_token_losses[filtered_indices]
+  answer = - filtered_token_losses.mean()
+  uc1_anydigits_oneloss = utils.to_numpy(answer)
+
+
+def calculate_uc1_loss(tokens, per_token_losses, use_carry1s, sum9s):
+  global uc1_perdigit_cases
+  global uc1_total_cases
+
+  # UC1 AnyDigits (exclude Sum9)
+  # Identity the tokens in the batch where UC1 is used at least once over the columns & Sum9 is never used
+  calculate_uc1_loss_any(tokens, per_token_losses, use_carry1s, sum9s)
+  uc1_anydigits_loss.append(uc1_anydigits_oneloss)
+
+  # UC1 PerDigit (exclude Sum9)
+  # For each token in the batch, identity the digit columns (e.g. 3) where UC1 is used on the columns & Sum9 is not true
+  uc1_perdigit_cases = 0
+  for digit_num in range(n_digits):
+    answer = 0
+    use_carry = use_carry1s[:, -1-digit_num]
+    no_sum9 = 1 - sum9s[:, -1-digit_num]
+    filtered_cases = use_carry & no_sum9
+    num_cases = utils.to_numpy(torch.sum(filtered_cases))
+    uc1_perdigit_cases += num_cases
+    uc1_total_cases += num_cases
+    if num_cases > 0 :
+      filtered_loss = per_token_losses[:, -1-digit_num] * filtered_cases
+      sum_loss = torch.sum(filtered_loss)
+      answer = - utils.to_numpy(sum_loss) / num_cases
+    if len(uc1_perdigit_loss)<=digit_num:
+      uc1_perdigit_loss.append([])
+    if (num_cases==0) & (len(uc1_perdigit_loss[digit_num]) > 0) :
+      answer = uc1_perdigit_loss[digit_num][-1] # Use the previous step's loss. Improves graph
+    uc1_perdigit_loss[digit_num].append(answer)
+
+# Use Sum 9 loss
+# Identify the subset of tokens that require US9 (being Sum9 and Carry1 from prev column) to get the correct answer
+# Array index 0 is the 'Units' digit. Array index 3 is the 'Thousands' digit.
+us9_anydigits_loss = []
+us9_anydigits_oneloss = 0
+
+us9_perdigit_loss = []
+us9_perdigit_cases = 0
+us9_total_cases = 0
+
+
+# US9 OneDigit
+# Identity the tokens in the batch where US9 is used at least once over the columns
+def calculate_us9_oneloss(tokens, per_token_losses, use_sum9s):
+  global us9_anydigits_oneloss
+
+  num_use_sum9s = torch.sum(use_sum9s, dim=1)
+  filtered_num_use_sum9s = torch.where( num_use_sum9s != 0, 1, 0 ) # At least OneDigit uses US9
+  num_cases = utils.to_numpy(torch.sum(filtered_num_use_sum9s))
+  filtered_indices = torch.nonzero(filtered_num_use_sum9s).squeeze()
+  filtered_token_losses = per_token_losses[filtered_indices]
+  answer = - filtered_token_losses.mean()
+  us9_anydigits_oneloss = utils.to_numpy(answer);
+
+
+def calculate_us9_loss(tokens, per_token_losses, use_sum9s):
+  global us9_perdigit_cases
+  global us9_total_cases
+
+  # US9 OneDigit
+  # Identity the tokens in the batch where US9 is used at least once over the columns
+  calculate_us9_oneloss(tokens, per_token_losses, use_sum9s)
+  us9_anydigits_loss.append(us9_anydigits_oneloss)
+
+  # For each token in the batch, identity the digit columns (e.g. 3) where US9 is used
+  us9_perdigit_cases = 0
+  for digit_num in range(n_digits):
+    answer = 0
+    use_carry = use_carry1s[:, -1-digit_num]
+    use_sum9 = sum9s[:, -1-digit_num]
+    filtered_cases = use_carry & use_sum9
+    num_cases = utils.to_numpy(torch.sum(filtered_cases))
+    us9_perdigit_cases += num_cases
+    us9_total_cases += num_cases
+    if num_cases > 0 :
+      filtered_loss = per_token_losses[:, -1-digit_num] * filtered_cases
+      sum_loss = torch.sum(filtered_loss)
+      answer = - utils.to_numpy(sum_loss) / num_cases
+    if len(us9_perdigit_loss)<=digit_num:
+      us9_perdigit_loss.append([])
+    if (num_cases==0) & (len(us9_perdigit_loss[digit_num]) > 0) :
+      answer = us9_perdigit_loss[digit_num][-1] # Use the previous step's loss. Improves graph
+    us9_perdigit_loss[digit_num].append(answer)
+
+
+# Check that us9_perdigit_loss, uc1_perdigit_loss and ba_perdigit_loss do NOT overlap
+# This ensures the graphs of each are non-overlapping
+def unit_test_nonoverlapping():
+  global ba_perdigit_cases
+  global ba_total_cases
+  global uc1_perdigit_cases
+  global uc1_total_cases
+  global us9_perdigit_cases
+  global us9_total_cases
+
+  perdigit_numcases = us9_perdigit_cases + uc1_perdigit_cases + ba_perdigit_cases
+  assert (perdigit_numcases == batch_size * n_digits), "Cases overlap: " + str(perdigit_numcases) + " != " + str(batch_size*n_digits)
+
+# Initialise the data generator
+ds = data_generator(batch_size, n_digits, seed)
+
+if train_model:
+  # Train the model
+  train_losses_list = []
+  per_token_train_losses_list = []
+
+  for epoch in tqdm.tqdm(range(n_epochs)):
+
+      tokens, base_adds, make_carry1s, sum9s, use_carry1s, use_sum9s = next(ds)
+      logits = model(tokens)
+
+      per_token_train_losses_raw, _ = logits_to_tokens_loss(logits, tokens)
+      per_token_train_losses = loss_fn(per_token_train_losses_raw)
+      per_token_train_losses_list.append(utils.to_numpy(per_token_train_losses))
+
+      train_loss = per_token_train_losses.mean()
+      train_loss.backward()
+      train_losses_list.append(train_loss.item())
+
+      calculate_ba_loss(tokens, per_token_train_losses_raw, base_adds, use_carry1s)
+      calculate_uc1_loss(tokens, per_token_train_losses_raw, use_carry1s, sum9s)
+      calculate_us9_loss(tokens, per_token_train_losses_raw, use_sum9s)
+
+      optimizer.step()
+      scheduler.step()
+      optimizer.zero_grad()
+
+      if epoch % 100 == 0:
+          print(epoch, train_loss.item())
+          if unit_tests:
+            unit_test_data_generator(tokens, use_carry1s, make_carry1s)
+            unit_test_nonoverlapping()
+
+
+if train_model:
+  # Save the model to file
+  torch.save(model.state_dict(), PthLocation)
+else:
+  # Load the model from file
+  model.load_state_dict(torch.load(PthLocation))
+  model.eval()
+
+epochs_to_graph=1200
+
+# Helper function to plot multiple lines
+def lines(raw_lines_list, x=None, mode='lines', labels=None, xaxis='Epoch', yaxis='Loss', title = '', log_y=False, hover=None, all_epochs=True, **kwargs):
+
+    lines_list = raw_lines_list if all_epochs==False else [row[:epochs_to_graph] for row in raw_lines_list]
+    log_suffix = '' if log_y==False else ' (Log)'
+    epoch_suffix = '' if all_epochs==False else ' (' + str(epochs_to_graph) + ' Epochs)'
+    full_title = title + log_suffix + epoch_suffix
+
+    if type(lines_list)==torch.Tensor:
+        lines_list = [lines_list[i] for i in range(lines_list.shape[0])]
+    if x is None:
+        x=np.arange(len(lines_list[0]))
+    if save_graph_to_file :
+      fig = go.Figure(layout={})
+      print(full_title)
+    else:
+      fig = go.Figure(layout={'title':full_title})
+
+    fig.update_xaxes(title=xaxis)
+    fig.update_yaxes(title=yaxis + log_suffix)
+    for c, line in enumerate(lines_list):
+        if type(line)==torch.Tensor:
+            line = utils.to_numpy(line)
+        if labels is not None:
+            label = labels[c]
+        else:
+            label = c
+        fig.add_trace(go.Scatter(x=x, y=line, mode=mode, name=label, hovertext=hover, **kwargs))
+    if log_y:
+        fig.update_layout(yaxis_type="log")
+    if save_graph_to_file:
+        fig.update_layout(margin=dict(l=10, r=10, t=10, b=10),width=1200,height=300)
+
+    fig.show(bbox_inches="tight")
+
+    if save_graph_to_file:
+        filename = full_title.replace(" ", "").replace("(", "").replace(")", "").replace("&", "").replace(",", "").replace("%", "")   +'.pdf'
+        pio.write_image(fig, filename)
+
+
+if train_model:
+  title_suffix = ' Loss Curves for ' + str(n_digits) + ' digit addition'
+  per_token_losses = np.stack(per_token_train_losses_list, axis=0)
+
+  line(train_losses_list,
+      title=title_suffix)
+
+  all_epochs = True;
+  for i in range(2):
+    lines([per_token_losses[:, i] for i in range(1+n_digits)]+[train_losses_list],
+          labels = [f'digit {i}' for i in range(1+n_digits)]+['all_digits'],
+          title='Per digit'+title_suffix,
+          all_epochs=all_epochs)
+
+    lines([per_token_losses[:, i] for i in range(1+n_digits)]+[train_losses_list],
+          labels = [f'digit {i}' for i in range(1+n_digits)]+['all_digits'],
+          title='Per digit'+title_suffix,
+          all_epochs=all_epochs,
+          log_y=True)
+
+    all_epochs = False;
+
+  for i in range(1+n_digits):
+    print('Final Loss for digit ' + str(i) + ' is ', per_token_losses[-1, i])
+
+# Graph per digit series using "normal" and "log" scale
+def graph_perdigit(losslist, num_series, title_suffix, showlog, all_epochs=True):
+  lines([losslist[i] for i in range(num_series)],
+        labels = [f'digit {i}' for i in range(num_series)],
+        title='Per digit '+title_suffix,
+        all_epochs=all_epochs)
+
+  if showlog:
+    lines([losslist[i] for i in range(num_series)],
+          labels = [f'digit {i}' for i in range(num_series)],
+          title='Per digit '+title_suffix,
+          all_epochs=all_epochs,
+          log_y=True)
+
+  if all_epochs==True :
+    total_loss = 0
+    for i in range(num_series):
+      print('Final Loss for digit ' + str(i) + ' is', losslist[i][-1])
+      total_loss += losslist[i][-1]
+    print('Mean Loss is', total_loss/num_series)
+    print()
+
+if train_model:
+  perc = (int)(100 * ba_total_cases / (ba_total_cases + uc1_total_cases + us9_total_cases))
+  print('BA Loss' + ' (' + str(ba_total_cases) + ' cases, ' + str(perc) + '%)')
+
+  the_title = 'BA Loss'
+
+  # For use cases where use_carry1s is false for all columns simultaneously, so BA can be used on all digits
+  line(ba_alldigits_loss, title='AllDigits '+the_title)
+
+  # For each digit independently
+  graph_perdigit(ba_perdigit_loss, n_digits, the_title, False, True)
+  graph_perdigit(ba_perdigit_loss, n_digits, the_title, False, False)
+
+if train_model:
+  perc = (int)(100 * uc1_total_cases / (ba_total_cases + uc1_total_cases + us9_total_cases))
+  print( 'UC1 Loss (' + str(uc1_total_cases) + ' cases, ' + str(perc) + '%)' )
+  the_title = 'UC1 Loss'
+
+  lines([uc1_anydigits_loss],
+        labels = ['at least 1 digit'],
+        title='AllDigits '+the_title)
+
+  # For each digit independently
+  graph_perdigit(uc1_perdigit_loss, n_digits, the_title, False, True)
+  graph_perdigit(uc1_perdigit_loss, n_digits, the_title, False, False)
+
+
+if train_model:
+  perc = (int)(100 * us9_total_cases / (ba_total_cases + uc1_total_cases + us9_total_cases))
+  print( 'US9 Loss (' + str(us9_total_cases) + ' cases, ' + str(perc) + '%)')
+  the_title = 'US9 Loss'
+
+  lines([us9_anydigits_loss],
+        labels = ['any digits'],
+        title='AllDigits '+the_title)
+
+  # For each digit independently
+  graph_perdigit(us9_perdigit_loss, n_digits, the_title, False, True)
+  graph_perdigit(us9_perdigit_loss, n_digits, the_title, False, False)
+
+if train_model:
+  for whichdigit in range(n_digits):
+
+    the_title = 'Loss for BA & UC1 tasks for Digit ' + str(whichdigit)
+
+    lines([ba_perdigit_loss[whichdigit]]+[uc1_perdigit_loss[whichdigit]],
+          labels = ['BA']+['UC1'],
+          title=the_title)
+    lines([ba_perdigit_loss[whichdigit]]+[uc1_perdigit_loss[whichdigit]],
+          labels = ['BA']+['UC1'],
+          title=the_title,
+          log_y=True)
+    lines([ba_perdigit_loss[whichdigit]]+[uc1_perdigit_loss[whichdigit]],
+          labels = ['BA']+['UC1'],
+          title=the_title,
+          all_epochs=False)
+
+if train_model:
+  for whichdigit in range(n_digits):
+
+    the_title = 'Loss for BA, UC1 & US9 Tasks for Digit ' + str(whichdigit)
+
+    lines([ba_perdigit_loss[whichdigit]]+[uc1_perdigit_loss[whichdigit]]+[us9_perdigit_loss[whichdigit]],
+          labels = ['BA']+['UC1']+['US9'],
+          title=the_title)
+    lines([ba_perdigit_loss[whichdigit]]+[uc1_perdigit_loss[whichdigit]]+[us9_perdigit_loss[whichdigit]],
+          labels = ['BA']+['UC1']+['US9'],
+          title=the_title,
+          log_y=True)
+    lines([ba_perdigit_loss[whichdigit]]+[uc1_perdigit_loss[whichdigit]]+[us9_perdigit_loss[whichdigit]],
+          labels = ['BA']+['UC1']+['US9'],
+          title=the_title,
+          all_epochs=False)
+
+tokens, base_adds, make_carry1s, sum9s, use_carry1s, use_sum9s = next(ds)
+
+print("tokens.shape", tokens.shape)
+print("sample tokens", tokens[:4])
+print(tokens_to_string(tokens[0]))
+print(tokens_to_string(tokens[1]))
+print(tokens_to_string(tokens[2]))
+print(tokens_to_string(tokens[3]))
+
+original_logits, cache = model.run_with_cache(tokens)
+print("original_logits.numel", original_logits.numel())
+
+W_E = model.embed.W_E[:-1]
+print("W_E shape:", W_E.shape)
+
+W_neur = W_E @ model.blocks[0].attn.W_V @ model.blocks[0].attn.W_O @ model.blocks[0].mlp.W_in
+print("W_neur shape:", W_neur.shape)
+
+W_logit = model.blocks[0].mlp.W_out @ model.unembed.W_U
+print("W_logit shape:", W_logit.shape)
+
+per_token_train_losses_original, _ = logits_to_tokens_loss(logits, tokens)
+original_loss = loss_fn(per_token_train_losses_original).mean()
+print("Original Loss:", utils.to_numpy(original_loss))
+
+pattern_a = cache["pattern", 0, "attn"][:, :, -1, 0]
+pattern_b = cache["pattern", 0, "attn"][:, :, -1, 1]
+neuron_acts = cache["post", 0, "mlp"][:, -1, :]
+neuron_pre_acts = cache["pre", 0, "mlp"][:, -1, :]
+
+for param_name, param in cache.items():
+    print(param_name + ' shape:', param.shape)
+
+def show_token_attention_patterns(index, token_at_index, use_case):
+  attention_pattern=cache["pattern", 0, "attn"][index]
+
+  # First token attention patterns
+  the_tokens = [str(token) for token in token_at_index.tolist()]
+  display(cv.attention.attention_patterns(
+      tokens=the_tokens,
+      attention=attention_pattern,
+      attention_head_names=[f"L0H{i}" for i in range(4)],
+  ))
+  #print(the_tokens)
+  #print(type(the_tokens))
+
+  tokens_str = tokens_to_string(the_tokens)
+  print(tokens_str)
+
+
+sample_size = 3
+
+# Show attention patterns for some randomly chosen tokens
+for i in range(sample_size):
+  show_token_attention_patterns(i, tokens[i], "Misc")
+
+
+if save_graph_to_file:
+  # print(tokens)
+  # print(type(tokens))
+
+  tokens_str = []
+  for i in range(3):
+    one_token_str = []
+    for j in tokens[i]:
+      one_token_str.append(str(utils.to_numpy(j)))
+    tokens_str.append(one_token_str)
+  # print(tokens_str)
+  # print(type(tokens_str))
+
+  # Refer https://github.com/callummcdougall/CircuitsVis/blob/main/python/circuitsvis/circuitsvis_demo.ipynb
+
+  html_object = cv.attention.from_cache(
+      cache = cache,
+      tokens = tokens_str, # list of list of strings
+      return_mode = "html",
+  )
+
+  # Create a CoLab file containing the attention pattern(s) in HTML
+  filename = "AttentionPattern" + str(n_digits) + "Digits" + str(n_heads) + "Heads.html"
+  with open(filename, "w") as f:
+      f.write(html_object.data)
+
+  # Manually download the CoLab "html" file and open in your local browser.
+  # Install and use the Edge extension "FireShot" to save a portion of the HTML page as a PDF
+
+any_use_carry1s = torch.any(use_carry1s.bool(), dim=1)
+no_use_carry1s = ~ any_use_carry1s
+ba_num_cases = utils.to_numpy(torch.sum(no_use_carry1s))
+if ba_num_cases >= sample_size :
+  print(f"Attention patterns for first few BA-only tokens ({ba_num_cases} of {tokens.shape[0]})")
+  ba_tokens = tokens[no_use_carry1s==1]
+  for i in range(sample_size):
+    show_token_attention_patterns(i, ba_tokens[i], "BAOnly")
+
+num_use_carry1s = torch.sum(use_carry1s, dim=1)
+any_use_carry1s = torch.where( num_use_carry1s != 0, 1, 0 ) # At least one digit uses UC1
+num_sum9s = torch.sum(use_sum9s, dim=1)
+no_sum9s = torch.where( num_sum9s == 0, 1, 0 ) # No digits have Sum9 true
+filtered_cases = any_use_carry1s & no_sum9s
+uc1_num_cases = utils.to_numpy(torch.sum(filtered_cases))
+if uc1_num_cases >= sample_size :
+  print(f"Attention patterns for first few UC1-only (and not US9) tokens ({uc1_num_cases} of {tokens.shape[0]})")
+  uc1_tokens = tokens[filtered_cases==1]
+  for i in range(sample_size):
+    show_token_attention_patterns(i, uc1_tokens[i], "UC1")
+
+num_sum9s = torch.sum(use_sum9s, dim=1)
+any_sum9s = torch.where( num_sum9s != 0, 1, 0 ) # At least one digit uses Sum9
+us9_cases = utils.to_numpy(torch.sum(any_sum9s))
+if us9_cases >= sample_size :
+  print(f"Attention patterns for first few US9 tokens ({us9_cases} of {tokens.shape[0]})")
+  us9_tokens = tokens[any_sum9s==1]
+  for i in range(sample_size):
+    show_token_attention_patterns(i, us9_tokens[i], "US9")
+
+p = 8
+px.imshow(cache["pattern", 0][:, 0, -1, 0].reshape(p, p).cpu(), title="Attention for Head 0 from a -> =", labels={"x":"b", "y":"a"})
+
+
+px.imshow(
+   einops.rearrange(cache["pattern", 0][:, :, -1, 0].cpu(), "(a b) head -> head a b", a=p, b=p),
+   title="Attention for Head 0 from a -> =", labels={"x":"b", "y":"a"}, facet_col=0)
+
+cache["post", 0, "mlp"].shape
+
+px.imshow(
+  einops.rearrange(neuron_acts[:, :5].cpu(), "(a b) neuron -> neuron a b", a=p, b=p),
+  title="First 5 neuron acts", labels={"x":"b", "y":"a"}, facet_col=0)
+
+U, S, Vh = torch.svd(W_E)
+line(S, title="Singular Value Decomposition")
+imshow(U, title="Principal Components on the Input")
+
+U, S, Vh = torch.svd(W_E)
+line(S, title="Singular Values")
+imshow(U, title="Principal Components on the Input")
+
+# Control - random Gaussian matrix
+U, S, Vh = torch.svd(torch.randn_like(W_E))
+line(S, title="Singular Values Random")
+imshow(U, title="Principal Components Random")
+
+U, S, Vh = torch.svd(W_E)
+line(U[:, :8].T, title="Principal Components of the embedding", xaxis="Input Vocabulary")
+
+def print_config():
+  print("n_digits=", n_digits, "n_heads=", n_heads, "n_layers=", n_layers, "n_ctx=", n_ctx)
+  print("seed=", seed, "n_training_steps=", n_epochs)
+  print()
+
+# Constants used to label questions by task to aid later analysis
+BA_CASE = 1
+UC1_CASE = 2
+SIMPLE_US9_CASE = 3
+CASCADE_US9_CASE = 4
+STEP_CASE = 5
+
+def case_to_task(the_case):
+  if the_case % 10 == BA_CASE:
+    return "BA"
+  if the_case % 10 == UC1_CASE:
+    return "MC1"
+  if the_case % 10 == SIMPLE_US9_CASE:
+    return "SimpleUS9"
+  if the_case % 10 == CASCADE_US9_CASE:
+    return "CascadeUS9"
+  if the_case % 10 == STEP_CASE:
+    return "Step"
+  return "Other"
+
+# Insert a number into the question
+def insert_question_number(the_question, index, first_digit_index, the_digits, n):
+
+  last_digit_index = first_digit_index + the_digits - 1
+
+  for j in range(the_digits):
+    the_question[index, last_digit_index-j] = n % 10
+    n = n // 10
+
+
+# Create a single question
+def make_a_question(the_question, index, q1, q2, the_case):
+  a = q1 + q2
+
+  insert_question_number(the_question, index, 0, n_digits, q1)
+
+  the_question[index, n_digits] = PLUS_INDEX
+
+  insert_question_number( the_question, index, n_digits+1, n_digits, q2)
+
+  the_question[index, 2*n_digits+1] = EQUALS_INDEX
+  offset = 2
+
+  insert_question_number(the_question, index, 2*n_digits + offset, n_digits+1, q1+q2)
+
+  the_question[index, 3*n_digits + offset + 1] = the_case
+
+
+def prediction_to_string(max_indices):
+  answer = "".join([str(i) for i in utils.to_numpy(max_indices)[0]])
+  return answer;
+
+def make_ba_questions(clean = True):
+  questions = torch.zeros((17, n_ctx+1)).to(torch.int64)
+  if n_digits >= 5 :
+    make_a_question( questions, 0, 12345, 33333, BA_CASE)
+    make_a_question( questions, 1, 33333, 12345, BA_CASE)
+    make_a_question( questions, 2, 45762, 33113, BA_CASE)
+    make_a_question( questions, 3, 888, 11111, BA_CASE)
+    make_a_question( questions, 4, 2362, 23123, BA_CASE)
+    make_a_question( questions, 5, 15, 81, BA_CASE)
+    make_a_question( questions, 6, 1000, 4440, BA_CASE)
+    make_a_question( questions, 7, 4440, 1000, BA_CASE)
+    make_a_question( questions, 8, 24033, 25133, BA_CASE)
+    make_a_question( questions, 9, 23533, 21133, BA_CASE)
+    make_a_question( questions, 10, 32500, 1, BA_CASE)
+    make_a_question( questions, 11, 31500, 1111, BA_CASE)
+    make_a_question( questions, 12, 5500, 12323, BA_CASE)
+    make_a_question( questions, 13, 4500, 2209, BA_CASE)
+    make_a_question( questions, 14, 10990, 44000, BA_CASE)
+    make_a_question( questions, 15, 60000, 30000, BA_CASE)
+    make_a_question( questions, 16, 10000, 20000, BA_CASE)
+  return questions[:, :-1] if clean else questions
+
+
+def make_uc1_questions(clean = True):
+  n = 24 if n_digits >= 10 else 19
+  questions = torch.zeros((n, n_ctx+1)).to(torch.int64)
+  if n_digits >= 5 :
+    make_a_question( questions, 0, 15, 45, UC1_CASE)
+    make_a_question( questions, 1, 25, 55, UC1_CASE)
+    make_a_question( questions, 2, 35, 59, UC1_CASE)
+    make_a_question( questions, 3, 40035, 40049, UC1_CASE)
+    make_a_question( questions, 4, 5025, 5059, UC1_CASE)
+    make_a_question( questions, 5, 15, 65, UC1_CASE)
+    make_a_question( questions, 6, 44000, 46000, UC1_CASE)
+    make_a_question( questions, 7, 70000, 40000, UC1_CASE)
+    make_a_question( questions, 8, 15000, 25000, UC1_CASE)
+    make_a_question( questions, 9, 35000, 35000, UC1_CASE)
+    make_a_question( questions, 10, 45000, 85000, UC1_CASE)
+    make_a_question( questions, 11, 67000, 85000, UC1_CASE)
+    make_a_question( questions, 12, 99000, 76000, UC1_CASE)
+    make_a_question( questions, 13, 1500, 4500, UC1_CASE)
+    make_a_question( questions, 14, 2500, 5500, UC1_CASE)
+    make_a_question( questions, 15, 3500, 5900, UC1_CASE)
+    make_a_question( questions, 16, 15020, 45091, UC1_CASE)
+    make_a_question( questions, 17, 25002, 55019, UC1_CASE)
+    make_a_question( questions, 18, 35002, 59019, UC1_CASE)
+  if n_digits >= 10 :
+    make_a_question( questions, 19, 25000000, 55000000, UC1_CASE)
+    make_a_question( questions, 20, 35000000, 59000000, UC1_CASE)
+    make_a_question( questions, 21, 150200000, 450910000, UC1_CASE)
+    make_a_question( questions, 22, 250020000, 550190000, UC1_CASE)
+    make_a_question( questions, 23, 350020000, 590190000, UC1_CASE)
+  return questions[:, :-1] if clean else questions
+
+
+def make_simple_us9_questions(clean = True):
+  questions = torch.zeros((18, n_ctx+1)).to(torch.int64)
+  if n_digits >= 5 :
+    make_a_question( questions, 0, 55, 45, SIMPLE_US9_CASE)
+    make_a_question( questions, 1, 45, 55, SIMPLE_US9_CASE)
+    make_a_question( questions, 2, 45, 59, SIMPLE_US9_CASE)
+    make_a_question( questions, 3, 35, 69, SIMPLE_US9_CASE)
+    make_a_question( questions, 4, 25, 79, SIMPLE_US9_CASE)
+    make_a_question( questions, 5, 15, 85, SIMPLE_US9_CASE)
+    make_a_question( questions, 6, 15, 88, SIMPLE_US9_CASE)
+    make_a_question( questions, 7, 15508, 14500, SIMPLE_US9_CASE)
+    make_a_question( questions, 8, 14508, 15500, SIMPLE_US9_CASE)
+    make_a_question( questions, 9, 24533, 25933, SIMPLE_US9_CASE)
+    make_a_question( questions, 10, 23533, 26933, SIMPLE_US9_CASE)
+    make_a_question( questions, 11, 32500, 7900, SIMPLE_US9_CASE)
+    make_a_question( questions, 12, 31500, 8500, SIMPLE_US9_CASE)
+    make_a_question( questions, 13, 550, 450, SIMPLE_US9_CASE)
+    make_a_question( questions, 14, 450, 550, SIMPLE_US9_CASE)
+    make_a_question( questions, 15, 10880, 41127, SIMPLE_US9_CASE)
+    make_a_question( questions, 16, 41127, 10880, SIMPLE_US9_CASE)
+    make_a_question( questions, 17, 12386, 82623, SIMPLE_US9_CASE)
+  return questions[:, :-1] if clean else questions
+
+
+def make_cascade_us9_questions(clean = True):
+  questions = torch.zeros((29, n_ctx+1)).to(torch.int64)
+  if n_digits >= 5 :
+    # These are two level UseSum9 cascades
+    make_a_question( questions, 0, 555, 445, CASCADE_US9_CASE)
+    make_a_question( questions, 1, 3340, 6660, CASCADE_US9_CASE)
+    make_a_question( questions, 2, 8880, 1120, CASCADE_US9_CASE)
+    make_a_question( questions, 3, 1120, 8880, CASCADE_US9_CASE)
+    make_a_question( questions, 4, 123, 877, CASCADE_US9_CASE)
+    make_a_question( questions, 5, 877, 123, CASCADE_US9_CASE)
+    make_a_question( questions, 6, 321, 679, CASCADE_US9_CASE)
+    make_a_question( questions, 7, 679, 321, CASCADE_US9_CASE)
+    make_a_question( questions, 8, 1283, 88786, CASCADE_US9_CASE)
+    # These are three level UseSum9 cascades
+    make_a_question( questions, 9, 5555, 4445, CASCADE_US9_CASE)
+    make_a_question( questions, 10, 55550, 44450, CASCADE_US9_CASE)
+    make_a_question( questions, 11, 334, 666, CASCADE_US9_CASE)
+    make_a_question( questions, 12, 3340, 6660, CASCADE_US9_CASE)
+    make_a_question( questions, 13, 33400, 66600, CASCADE_US9_CASE)
+    make_a_question( questions, 14, 888, 112, CASCADE_US9_CASE)
+    make_a_question( questions, 15, 8880, 1120, CASCADE_US9_CASE)
+    make_a_question( questions, 16, 88800, 11200, CASCADE_US9_CASE)
+    make_a_question( questions, 17, 1234, 8766, CASCADE_US9_CASE)
+    make_a_question( questions, 18, 4321, 5679, CASCADE_US9_CASE)
+    # These are four level UseSum9 cascades
+    make_a_question( questions, 19, 44445, 55555, CASCADE_US9_CASE)
+    make_a_question( questions, 20, 33334, 66666, CASCADE_US9_CASE)
+    make_a_question( questions, 21, 88888, 11112, CASCADE_US9_CASE)
+    make_a_question( questions, 22, 12345, 87655, CASCADE_US9_CASE)
+    make_a_question( questions, 23, 54321, 45679, CASCADE_US9_CASE)
+    make_a_question( questions, 24, 45545, 54455, CASCADE_US9_CASE)
+    make_a_question( questions, 25, 36634, 63366, CASCADE_US9_CASE)
+    make_a_question( questions, 26, 81818, 18182, CASCADE_US9_CASE)
+    make_a_question( questions, 27, 87345, 12655, CASCADE_US9_CASE)
+    make_a_question( questions, 28, 55379, 44621, CASCADE_US9_CASE)
+  return questions[:, :-1] if clean else questions
+
+
+# These questions focus mainly on 1 digit at a time
+# (We're assuming that the 0 + 0 digit additions are trivial bigrams)
+def make_step_questions(clean = True):
+  questions = torch.zeros((26, n_ctx+1)).to(torch.int64)
+  if n_digits >= 5 :
+      make_a_question( questions, 0, 1, 0, STEP_CASE)
+      make_a_question( questions, 1, 4, 3, STEP_CASE)
+      make_a_question( questions, 2, 5, 5, STEP_CASE)
+      make_a_question( questions, 3, 8, 1, STEP_CASE)
+      make_a_question( questions, 4, 40, 30, STEP_CASE)
+      make_a_question( questions, 5, 44, 46, STEP_CASE)
+      make_a_question( questions, 6, 400, 300, STEP_CASE)
+      make_a_question( questions, 7, 440, 460, STEP_CASE)
+      make_a_question( questions, 8, 800, 100, STEP_CASE)
+      make_a_question( questions, 9, 270, 470, STEP_CASE)
+      make_a_question( questions, 10, 600, 300, STEP_CASE)
+      make_a_question( questions, 11, 4000, 3000, STEP_CASE)
+      make_a_question( questions, 12, 4400, 4600, STEP_CASE)
+      make_a_question( questions, 13, 6000, 3000, STEP_CASE)
+      make_a_question( questions, 14, 7000, 4000, STEP_CASE)
+      make_a_question( questions, 15, 40000, 30000, STEP_CASE)
+      make_a_question( questions, 16, 44000, 46000, STEP_CASE)
+      make_a_question( questions, 17, 60000, 30000, STEP_CASE)
+      make_a_question( questions, 17, 70000, 40000, STEP_CASE)
+      make_a_question( questions, 19, 10000, 20000, STEP_CASE)
+      make_a_question( questions, 20, 15000, 25000, STEP_CASE)
+      make_a_question( questions, 21, 35000, 35000, STEP_CASE)
+      make_a_question( questions, 22, 45000, 85000, STEP_CASE)
+      make_a_question( questions, 23, 67000, 85000, STEP_CASE)
+      make_a_question( questions, 24, 99000, 76000, STEP_CASE)
+      make_a_question( questions, 25, 76000, 99000, STEP_CASE)
+  return questions[:, :-1] if clean else questions
+
+
+# Returns ~100 manually-chosen questions
+def all_manual_questions(clean=True):
+  q1 = make_ba_questions(clean)
+  q2 = make_uc1_questions(clean)
+  q3 = make_simple_us9_questions(clean)
+  q4 = make_cascade_us9_questions(clean)
+  q5 = make_step_questions(clean)
+
+  all_manual = torch.vstack((q1, q2, q3, q4, q5))
+
+  return all_manual
+
+
+# Returns 64 random and ~100 manually-chosen questions
+def make_varied_questions():
+  random_questions, _, _, _, _, _ = next(ds)
+
+  all_manual = all_manual_questions()
+
+  all_tokens = torch.vstack((random_questions.cuda(), all_manual.cuda()))
+
+  return all_tokens
+
+num_questions = 0;
+correct_answers = 0;
+verbose = True
+total_mean_loss = 0.0
+
+
+# Clear the question summary results
+def clear_questions_results(title):
+  global num_questions
+  global correct_answers
+  global verbose
+  global total_mean_loss
+
+  num_questions = 0
+  correct_answers = 0
+  total_mean_loss = 0
+
+  if verbose:
+    print(title)
+
+
+# Ask model to predict answer for each question & collect results
+def do_questions(questions):
+    global num_questions
+    global correct_answers
+    global verbose
+    global total_mean_loss
+
+    num_questions = questions.shape[0]
+    for question_num in range(num_questions):
+      q = questions[question_num]
+
+      # Run with no hook
+      the_logits = model(q.cuda())
+
+      q_2d = q.unsqueeze(0)
+      losses_raw, max_indices = logits_to_tokens_loss(the_logits, q_2d.cuda())
+      losses = loss_fn(losses_raw)
+      mean_loss = utils.to_numpy(losses.mean())
+      total_mean_loss = total_mean_loss + mean_loss
+
+      model_answer_str = prediction_to_string(max_indices)
+      model_answer_num = int(model_answer_str)
+
+      i = n_digits*2 + 2
+
+      a = 0
+      # 5 digit addition yields a 6 digit answer. Hence n_digits+1
+      for j in range(n_digits+1):
+        a = a * 10 + q[i+j]
+
+      correct = (model_answer_num == a)
+      if correct :
+        correct_answers += 1
+
+      if verbose:
+        print(tokens_to_string(q), "ModelAnswer:", model_answer_str, "Correct:", correct, "Loss:", mean_loss )
+
+
+# Print the question summary results
+def print_questions_results(prefix):
+  global num_questions
+  global correct_answers
+  global verbose
+  global total_mean_loss
+
+  print(prefix, num_questions, "questions.", correct_answers, "correct. % Correct:", 100*correct_answers/num_questions, "Mean loss:", total_mean_loss/num_questions)
+  if verbose:
+    print("")
+
+# Build a test batch of 64 random and ~100 manually-chosen questions
+varied_questions = make_varied_questions();
+
+# Run the sample batch, gather the cache
+model.reset_hooks()
+model.set_use_attn_result(True)
+sample_logits, sample_cache = model.run_with_cache(varied_questions.cuda())
+print(sample_cache) # Gives names of datasets in the cache
+sample_losses_raw, sample_max_indices = logits_to_tokens_loss(sample_logits, varied_questions.cuda())
+sample_loss_mean = utils.to_numpy(loss_fn(sample_losses_raw).mean())
+print("Sample Mean Loss", sample_loss_mean) # Loss < 0.04 is good
+
+# attn.hook_z is a key output of the attention heads, combining pattern and value
+hook_l0_z_name = 'blocks.0.attn.hook_z'
+sample_attn_z = sample_cache[hook_l0_z_name]
+print("Sample", hook_l0_z_name, sample_attn_z.shape) # gives [64, 18, 3, 170] = batch_size, num_tokens, n_heads, d_model
+mean_attn_z = torch.mean(sample_attn_z, dim=0, keepdim=True)
+print("Mean", hook_l0_z_name, mean_attn_z.shape) # gives [1, 18, 3, 170] = 1, num_tokens, n_heads, d_model
+hook_l1_z_name = 'blocks.1.attn.hook_z'
+
+hook_l0_resid_post_name = 'blocks.0.hook_resid_post'
+sample_resid_post = sample_cache[hook_l0_resid_post_name]
+print("Sample", hook_l0_resid_post_name, sample_resid_post.shape) # gives [64, 18, 510] = batch_size, num_tokens, d_model
+mean_resid_post = torch.mean(sample_resid_post, dim=0, keepdim=True)
+print("Mean", hook_l0_resid_post_name, mean_resid_post.shape) # gives [1, 18, 510] = 1, num_tokens, d_model
+hook_l1_resid_post_name = 'blocks.1.hook_resid_post'
+
+print_config()
+
+def do_ba_questions():
+  clear_questions_results("Simple BaseAdd cases")
+  questions = make_ba_questions()
+  do_questions(questions)
+  print_questions_results("BaseAdd:")
+
+def do_uc1_questions():
+  clear_questions_results("These are Use Carry 1 (UC1) examples (not UseSum9 examples)")
+  questions = make_uc1_questions()
+  do_questions(questions)
+  print_questions_results("UseCarry1:")
+
+def do_simple_us9_questions():
+  clear_questions_results("These are simple (one level) UseSum9 exampless")
+  questions = make_simple_us9_questions()
+  do_questions(questions)
+  print_questions_results("SimpleUS9")
+
+def do_cascade_us9_questions():
+  clear_questions_results("These are UseSum9 two, three and four level cascades")
+  questions = make_cascade_us9_questions()
+  do_questions(questions)
+  print_questions_results("CascadeUS9")
+
+def do_step_questions():
+  clear_questions_results("These questions focus on different steps")
+  questions = make_step_questions()
+  do_questions(questions)
+  print_questions_results("Steps")
+
+verbose = False
+
+do_ba_questions()
+do_uc1_questions()
+do_simple_us9_questions()
+do_cascade_us9_questions()
+do_step_questions()
+
+print_config()
+
+# Claim Experiments Part 1 - Sample question accuracy with no interference
+layer_to_ablate = 0
+verbose = False
+
+do_ba_questions()
+do_uc1_questions()
+do_simple_us9_questions()
+do_cascade_us9_questions()
+
+# Experiment 3: Apply a hook to override residual stream (blocks.0.hook_resid_post) in each step in turn and see impact on loss
+
+experiment3_step = 0  # zero-based step to ablate
+experiment3_threshold = 0.08
+
+def experiment3_hook(value, hook):
+  #print( "In hook", hook_l0_resid_post_name, experiment3_ablate, experiment3_step, value.shape) # Get [64, 18, 510] = batch_size, num_tokens, d_model
+
+  # Copy the mean resid post values in step N to all the batch questions
+  value[:,experiment3_step,:] = mean_resid_post[0,experiment3_step,:].clone()
+
+
+if n_digits >= 5 :
+  experiment3_fwd_hooks = [(hook_l0_resid_post_name, experiment3_hook)]
+
+  for experiment3_step in range(n_ctx):
+    model.reset_hooks()
+    experiment3_logits = model.run_with_hooks(varied_questions.cuda(), return_type="logits", fwd_hooks=experiment3_fwd_hooks)
+    experiment3_losses_raw, resid_post_max_indices = logits_to_tokens_loss(experiment3_logits, varied_questions.cuda())
+    experiment3_loss_mean = utils.to_numpy(loss_fn(experiment3_losses_raw).mean())
+
+    loss_description = "Good" if experiment3_loss_mean < experiment3_threshold else "BAD"
+    print("Sample Loss", hook_l0_resid_post_name, "Loss", experiment3_loss_mean, "Step", experiment3_step, "Ablate", loss_description)
+
+  print()
+
+# Claim Experiments Part 5 - Ablate heads with BA
+
+experiment5_head = 0 # zero-based head to ablate
+experiment5_ablate = 0
+experiment5_threshold = 0.08
+
+
+def experiment5_hook(value, hook):
+  #print( "In hook", hook_l0_z_name, experiment5_head, experiment5_ablate, experiment5_case, value.shape) # Get [64, 18, 3, 170] = batch_size, num_heads, d_model
+  if experiment5_ablate == 1:
+    # Ablate the attn_z values into all the batch questions
+    value[:,:,experiment5_head,:] = mean_attn_z[0,:,experiment5_head,:].clone() # Mean ablate
+    #value[:,:,experiment5_head,:] = 0 # Zero ablate
+
+
+if n_digits == 5 :
+  experiment5_fwd_hooks = [(hook_l0_z_name, experiment5_hook)]
+
+  for experiment5_ablate in range(2):
+    for experiment5_head in range(3):
+
+      the_question = make_ba_questions() # Base Add cases
+
+      model.reset_hooks()
+      experiment5_logits = model.run_with_hooks(the_question.cuda(), return_type="logits", fwd_hooks=experiment5_fwd_hooks)
+      experiment5_losses_raw, resid_post_max_indices = logits_to_tokens_loss(experiment5_logits, the_question.cuda())
+      experiment5_loss_mean = utils.to_numpy(loss_fn(experiment5_losses_raw).mean())
+
+      experiment5_ablate_description = "No action" if experiment5_ablate == 0 else "Ablate"
+      experiment5_loss_description = "Good" if experiment5_loss_mean < experiment5_threshold else "Bad"
+      print("Sample Loss BA", hook_l0_z_name, "Head", experiment5_head, "Loss", experiment5_loss_mean, experiment5_ablate_description, experiment5_loss_description)
+
+    print()
+
+# Compare each digit in the two answer. Returns a yyNNy pattern where y means the digits match
+def get_answer_matches(a_int, answer_str):
+  a_str = str(a_int.cpu().numpy()).zfill(n_digits+1)
+  match_str = ""
+  for i in range(n_digits+1):
+      if answer_str[i] == a_str[i]:
+          match_str += "y"  # Matching digit
+      else:
+          match_str += "N"  # Non-matching digit
+  return match_str
+
+# Build up a count of patterns found
+exp2_step_counts = {}
+
+def clear_step_counts():
+  global exp2_step_counts
+
+  exp2_step_counts = {}
+
+def add_step_count(step_key):
+  global exp2_step_counts
+
+  if step_key in exp2_step_counts:
+    # If the key is already in the dictionary, increment its count
+    exp2_step_counts[step_key] += 1
+  else:
+    # If the key is not in the dictionary, add it with a count of 1
+    exp2_step_counts[step_key] = 1
+
+def print_step_counts():
+  global exp2_step_counts
+
+  if len(exp2_step_counts) > 0 :
+    print("  Step failures:", exp2_step_counts)
+
+def get_step_counts_total():
+  global exp2_step_counts
+
+  if len(exp2_step_counts) == 0:
+    return 0
+
+  total_sum = 0
+  for key, value in exp2_step_counts.items():
+      if isinstance(value, int):
+          total_sum += value
+  return total_sum
+
+# Search the manual questions for a match. If found return the use case
+def get_manual_case(q, all_manual_qs):
+  qn = utils.to_numpy(q)
+
+  num_manual_qs = all_manual_qs.shape[0]
+  for manual_q_num in range(num_manual_qs):
+    manual_q = utils.to_numpy(all_manual_qs[manual_q_num])
+    if np.array_equal(qn[:2*n_digits+2], manual_q[:2*n_digits+2]):
+      case_digit = manual_q[-1]
+      return case_to_task(case_digit)
+
+  return "?"
+
+# Build up a count of cases found
+exp2_case_counts = {}
+
+def clear_case_counts():
+  global exp2_case_counts
+
+  exp2_case_counts = {}
+
+def add_case_count(case_key):
+  global exp2_case_counts
+
+  if case_key in exp2_case_counts:
+    # If the key is already in the dictionary, increment its count
+    exp2_case_counts[case_key] += 1
+  else:
+    # If the key is not in the dictionary, add it with a count of 1
+    exp2_case_counts[case_key] = 1
+
+def print_case_counts():
+  global exp2_case_counts
+
+  if len(exp2_case_counts) > 0:
+    print( "  Case failures:", exp2_case_counts)
+
+def do_experiment_question(questions, the_hook, the_threshold):
+
+    num_questions = questions.shape[0]
+    for question_num in range(num_questions):
+      q = questions[question_num]
+
+      model.reset_hooks()
+      exp_logits = model.run_with_hooks(q.cuda(), return_type="logits", fwd_hooks=the_hook)
+
+      q_2d = q.unsqueeze(0)
+      exp_losses_raw, exp_max_indices = logits_to_tokens_loss(exp_logits, q_2d.cuda())
+      exp_loss_mean = utils.to_numpy(loss_fn(exp_losses_raw).mean())
+      exp_answer_str = prediction_to_string(exp_max_indices)
+
+      i = 12
+      a = q[i+0] * 100000 + q[i+1] * 10000 + q[i+2] * 1000 + q[i+3] * 100 + q[i+4] * 10 + q[i+5] * 1;
+
+      # Only count the question if the loss exceeds the threshold (because of the ablated step)
+      if exp_loss_mean > the_threshold:
+        match_str = get_answer_matches( a, exp_answer_str )
+        # Only count the question if the model got the question wrong
+        if 'N' in match_str:
+          the_case = get_manual_case(q, questions)
+          if verbose:
+            print(tokens_to_string(q), "ModelAnswer:", exp_answer_str, "Matches:", match_str, "Loss:", exp_loss_mean, "Case:", the_case )
+          else:
+            add_case_count(the_case)
+            add_step_count(match_str)
+
+# Claim Experiments Part 2 - Ablate all heads in each step to see what question digits and tasks then fail.
+
+experiment2_step = 0 # zero-based step to ablate
+experiment2_threshold = 0.1
+experiment2_questions = all_manual_questions(False)
+
+verbose = False;
+print_config()
+
+
+def experiment2_hook(value, hook):
+  # Copy the mean resid post values in step N to all the batch questions
+  #value[:,experiment2_step,:] = mean_resid_post[0,experiment2_step,:].clone()
+  value[:,experiment2_step,:] = 0
+
+
+if n_digits >= 5 :
+  experiment2_fwd_hooks = [(hook_l0_resid_post_name, experiment2_hook)]
+
+  print("Num questions:", varied_questions.shape[0])
+  for experiment2_step in range(n_ctx):
+    clear_case_counts()
+    clear_step_counts()
+    print( "Ablating all heads in step", experiment2_step)
+
+    do_experiment_question(varied_questions, experiment2_fwd_hooks, experiment2_threshold)
+
+    if not verbose:
+      print_case_counts()
+      print_step_counts()
+
+# Claim Experiments Part 4 - Ablate heads with simple US9
+
+experiment4_head = 0 # zero-based head to ablate
+experiment4_ablate = 0
+experiment4_threshold = 0.25
+
+def experiment4_hook(value, hook):
+  #print( "In hook", hook_l0_z_name, experiment4_head, experiment4_ablate, experiment4_case, value.shape) # Get [64, 18, 3, 170] = batch_size, num_heads, d_model
+  if experiment4_ablate == 1:
+    # Copy the mean attn_z values into all the batch questions
+    #value[:,:,experiment4_head,:] = mean_attn_z[0,:,experiment4_head,:].clone() # Mean ablate
+    value[:,:,experiment4_head,:] = 0 # Zero ablate
+
+
+if n_digits == 5 :
+  experiment4_fwd_hooks = [(hook_l0_z_name, experiment4_hook)]
+
+  for experiment4_ablate in range(2):
+    for experiment4_head in range(3):
+
+      the_question = make_simple_us9_questions() # Simple US9 cases
+
+      model.reset_hooks()
+      experiment4_logits = model.run_with_hooks(the_question.cuda(), return_type="logits", fwd_hooks=experiment4_fwd_hooks)
+      experiment4_losses_raw, resid_post_max_indices = logits_to_tokens_loss(experiment4_logits, the_question.cuda())
+      experiment4_loss_mean = utils.to_numpy(loss_fn(experiment4_losses_raw).mean())
+
+      experiment4_ablate_description = "No action" if experiment4_ablate == 0 else "Ablate"
+      experiment4_loss_description = "Good" if experiment4_loss_mean < experiment4_threshold else "Bad"
+      print("Sample Loss US9", hook_l0_z_name, "Head", experiment4_head, "Loss", experiment4_loss_mean, experiment4_ablate_description, experiment4_loss_description)
+
+    print()
+
+# Claim Experiments Part 6 - Ablate heads with MC1
+
+experiment6_head = 0 # zero-based head to ablate
+experiment6_ablate = 0
+experiment6_threshold = 0.25
+
+
+def experiment6_hook(value, hook):
+  #print( "In hook", hook_l0_z_name, experiment6_head, experiment6_ablate, experiment6_case, value.shape) # Get [64, 18, 3, 170] = batch_size, num_heads, d_model
+  if experiment6_ablate == 1:
+    # Ablate the attn_z values into all the batch questions
+    #value[:,:,experiment6_head,:] = mean_attn_z[0,:,experiment6_head,:].clone() # Mean ablate
+    value[:,:,experiment6_head,:] = 0 # Zero ablate
+
+
+if n_digits == 5 :
+  experiment6_fwd_hooks = [(hook_l0_z_name, experiment6_hook)]
+
+  for experiment6_ablate in range(2):
+    for experiment6_head in range(3):
+
+      the_question = make_uc1_questions() # Use Carry 1 cases
+
+      model.reset_hooks()
+      experiment6_logits = model.run_with_hooks(the_question.cuda(), return_type="logits", fwd_hooks=experiment6_fwd_hooks)
+      experiment6_losses_raw, resid_post_max_indices = logits_to_tokens_loss(experiment6_logits, the_question.cuda())
+      experiment6_loss_mean = utils.to_numpy(loss_fn(experiment6_losses_raw).mean())
+
+      experiment6_ablate_description = "No action" if experiment6_ablate == 0 else "Ablate"
+      experiment6_loss_description = "Good" if experiment6_loss_mean < experiment6_threshold else "Bad"
+      print("Sample Loss MC1", hook_l0_z_name, "Head", experiment6_head, "Loss", experiment6_loss_mean, experiment6_ablate_description, experiment6_loss_description)
+
+    print()
